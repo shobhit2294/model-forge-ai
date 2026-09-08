@@ -1,0 +1,51 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8010:8000"
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: [infra]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - agent-prometheus:/prometheus
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: [infra]
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - agent-grafana:/var/lib/grafana
+  postgres:
+    image: pgvector/pgvector:pg17
+    profiles: [infra]
+    environment:
+      POSTGRES_DB: agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent_local_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - agent-postgres:/var/lib/postgresql/data
+  mlflow:
+    build:
+      context: .
+      dockerfile: infra/mlflow.Dockerfile
+    profiles: [infra]
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql://agent:agent_local_only@postgres:5432/agent --default-artifact-root /mlruns
+    ports:
+      - "5000:5000"
+    depends_on:
+      - postgres
+    volumes:
+      - agent-mlflow:/mlruns
+volumes:
+  agent-postgres:
+  agent-prometheus:
+  agent-grafana:
+  agent-mlflow:

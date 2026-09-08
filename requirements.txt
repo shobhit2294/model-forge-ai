@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pytest==8.3.4
+httpx==0.28.1
+scikit-learn==1.6.1
+joblib==1.4.2
+langgraph==0.2.60
+prometheus-client==0.21.1
+pandas==2.2.3
+openpyxl==3.1.5
+pyarrow==18.1.0
