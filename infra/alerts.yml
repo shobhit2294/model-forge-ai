@@ -1,0 +1,66 @@
+groups:
+  - name: ai-engineering-agent
+    rules:
+      - alert: PredictionServiceUnavailable
+        expr: up{job="ai-engineering-agent"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: AI Engineering Agent is unreachable
+          description: Prometheus has failed to scrape the prediction service for at least one minute.
+
+      - alert: PredictionLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le, task) (rate(ai_agent_prediction_latency_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Prediction p95 latency exceeds one second
+          description: Prediction latency has remained above one second at p95 for five minutes.
+
+      - alert: PredictionErrorsHigh
+        expr: |
+          sum(rate(ai_agent_prediction_errors_total[5m]))
+          /
+          clamp_min(
+            sum(rate(ai_agent_predictions_total[5m]))
+            + sum(rate(ai_agent_prediction_errors_total[5m])),
+            1e-9
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prediction error ratio exceeds five percent
+          description: More than five percent of prediction requests have failed for five minutes.
+
+      - alert: InputDataDriftHigh
+        expr: max_over_time(ai_agent_input_drift_score[10m]) >= 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Input feature drift detected
+          description: Population stability index has exceeded 0.2 for at least five minutes.
+
+      - alert: ModelPerformanceDegraded
+        expr: ai_agent_model_performance_degradation >= 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Labeled model performance degraded
+          description: Performance on feedback labels has degraded at least twenty percent relative to validation.
+
+      - alert: WorkflowFailuresHigh
+        expr: |
+          sum(rate(ai_agent_workflow_runs_total{status="failed"}[10m]))
+          /
+          clamp_min(sum(rate(ai_agent_workflow_runs_total[10m])), 1e-9) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Workflow failure ratio exceeds ten percent
+          description: More than ten percent of workflow runs have failed over the last ten minutes.

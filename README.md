@@ -1,187 +1,128 @@
 # AI Engineering Agent
 
-Upload a dataset, describe the business goal, and let the application inspect the data, compare models, and decide whether a model is ready to deploy.
+Upload any dataset. Describe what you want to predict. The agents take it from there.
 
-## Simple flow
+This isn't a template or a notebook you have to configure. You drop in a file, confirm which column you're trying to predict, and a set of agents runs the full ML pipeline — inspecting the data, training several models, picking the best one, and handing you a live prediction endpoint. If the model doesn't meet your score threshold, it tells you why and blocks deployment rather than giving you something that doesn't work.
 
-```mermaid
-flowchart LR
-	UserUpload[User uploads dataset] --> FastAPIService[FastAPI API]
-	FastAPIService --> WorkflowOrchestrator[Orchestrator]
-	WorkflowOrchestrator --> DataAgent[Data Agent\nProfile and quality checks]
-	DataAgent --> ResearchAgent[Research Agent\nChoose methods]
-	ResearchAgent --> ModelAgent[Model Agent\nTrain and compare]
-	ModelAgent --> DecisionAgent{Decision Agent\nQuality gate}
-	DecisionAgent -->|Pass| ModelArtifact[Save model artifact]
-	DecisionAgent -->|Fail| ImprovementStep[Return improvement step]
-	ModelArtifact --> PredictionAPI[Prediction API]
-	ModelArtifact --> MonitoringMetrics[Monitoring metrics]
-```
+It runs entirely on your machine. No cloud account, no API keys, no external services required.
 
-## What happens
+---
 
-| Step | What it does | Main code |
-| --- | --- | --- |
-| 1. Upload | Receives CSV, JSON, JSONL, Excel, or Parquet | `app/main.py` |
-| 2. Profile | Finds columns, types, missing values, row count, and target | `app/pipeline.py` |
-| 3. Research | Selects an approved local method catalog | `app/research.py` |
-| 4. Train | Builds preprocessing pipelines and tests candidate models | `app/pipeline.py` |
-| 5. Decide | Checks the requested metric, score, labels, and duplicates | `app/orchestrator.py` |
-| 6. Deploy | Saves an approved model as a Joblib artifact | `artifacts/` |
-| 7. Predict | Uses the saved model for new feature values | `app/main.py` |
-| 8. Monitor | Exposes latency, errors, predictions, and model signals | `app/metrics.py` |
+## Getting started in one command
 
-## Supported ML paths
+Make sure Docker Desktop is open and running, then:
 
-```mermaid
-flowchart TD
-	DatasetInput[Dataset] --> TargetColumn{Target column?}
-	TargetColumn -->|No| UnsupervisedRecommendation[Unsupervised recommendation\nNo deployment model]
-	TargetColumn -->|Yes| TargetType{Target type}
-	TargetType -->|Categories| ClassificationModels[Classification\nRandom Forest + Logistic Regression]
-	TargetType -->|Continuous number| RegressionModels[Regression\nRandom Forest + Ridge]
-	ClassificationModels --> ClassificationMetrics[Accuracy, precision, recall, F1, confusion matrix]
-	RegressionModels --> RegressionMetrics[MAE, RMSE, R2]
-```
+    docker compose up --build
 
-The pipeline uses median imputation and scaling for numeric columns, most-frequent imputation and one-hot encoding for categorical columns, and keeps preprocessing together with the model to avoid training/inference differences.
+Go to http://localhost:8010
 
-## Project structure
+That's the whole setup. Docker builds the frontend and starts the backend together.
 
-```text
-AI Engineering Agent/
-├── app/
-│   ├── main.py              # FastAPI routes and file upload
-│   ├── orchestrator.py      # Runs the complete agent workflow
-│   ├── pipeline.py          # Profiling, preprocessing, training, metrics
-│   ├── research.py          # Approved research and model catalog
-│   ├── workflow_graph.py    # LangGraph workflow routing
-│   ├── metrics.py           # Prometheus metrics
-│   └── static/               # Backend-served static UI files
-├── frontend/
-│   ├── src/main.jsx         # React interface and API calls
-│   ├── src/*.css            # Interface styles
-│   └── vite.config.js       # Vite dev server and API proxy
-├── data/                    # Demo input datasets
-├── artifacts/               # Saved approved models
-├── tests/                   # Backend tests
-├── Dockerfile               # Builds frontend and backend image
-├── docker-compose.yml       # Local service and optional infrastructure
-└── requirements.txt         # Python dependencies
-```
+---
 
-## Technology stack
+## If you prefer running it without Docker
 
-| Technology | Why it is used |
-| --- | --- |
-| React | Builds the web page where the user uploads data and starts a run. |
-| Vite | Runs the React frontend during development and proxies `/api` calls to FastAPI. |
-| FastAPI | Provides file upload, workflow, prediction, health, and metrics endpoints. |
-| LangGraph | Connects the named workflow agents and records the next decision route. |
-| Python | Runs the backend, data processing, orchestration, and model workflow. |
-| pandas | Reads Excel and Parquet files and converts them into rows for profiling. |
-| scikit-learn | Detects the task, preprocesses columns, trains models, and calculates metrics. |
-| Joblib | Saves the complete preprocessing plus model pipeline for later predictions. |
-| Prometheus client | Counts requests, errors, predictions, and latency at `/metrics`. |
-| Docker Compose | Runs the API, frontend build, and optional monitoring services consistently. |
+You'll need Python 3.12 and Node 18+.
 
-### How the stack connects
+Set up Python:
 
-```text
-React browser page
-	-> Vite development server
-	-> FastAPI HTTP endpoints
-	-> LangGraph + Python orchestrator
-	-> pandas + scikit-learn pipeline
-	-> Joblib model artifact
-	-> FastAPI prediction endpoint
-```
+    py -3.12 -m venv .venv312
+    .\.venv312\Scripts\Activate.ps1
+    pip install -r requirements.txt
 
-The research component currently uses a local approved catalog. It does not invent external papers or require an API key. Prometheus reads the metrics endpoint; it is not involved in training or prediction decisions.
+Start the backend:
 
-## Run locally
+    python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
 
-Use Python 3.12 for the pinned scientific packages.
+Then in a second terminal:
 
-### 1. Start the backend
+    cd frontend
+    npm install
+    npm run dev
 
-```powershell
-py -3.12 -m venv .venv312
-.\.venv312\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
-```
+Open the URL that Vite prints (usually http://localhost:5173).
 
-Backend URLs:
+---
 
-```text
-Health:  http://127.0.0.1:8010/health
-API:     http://127.0.0.1:8010/docs
-Metrics: http://127.0.0.1:8010/metrics
-```
+## What to expect when you use it
 
-### 2. Start the frontend
+When you upload a file, the UI immediately profiles it — before you start training. It shows you the row count, column types, and which column looks like a prediction target. You confirm that target (or pick a different one), set your metric and minimum acceptable score, then click run.
 
-Open a second terminal:
+From there the agents work through the pipeline:
 
-```powershell
-cd frontend
-npm install
-npm run dev
-```
+1. Data agent — checks for missing values, duplicates, class imbalance, and columns that look like they contain future information (leakage)
+2. Research agent — picks which ML methods make sense for your data
+3. Model agent — trains multiple candidates on a training split and tests on held-out data it hasn't seen
+4. Decision agent — checks if the winner beats your threshold and the data quality checks pass
+5. If it passes, you get an approval prompt before anything is deployed
+6. DevOps agent — packages the winning model and all its preprocessing into a single file
+7. Monitoring agent — starts tracking every prediction you make
 
-Open the Vite URL shown in the terminal, usually `http://localhost:5173`. The Vite proxy forwards `/api` requests to the backend on port `8010`.
+When a model is deployed, a prediction form appears in the UI. Fill in the feature values for a new example and it returns a prediction instantly — the same preprocessing pipeline the model was trained with runs automatically.
 
-### 3. Run tests
+---
 
-```powershell
-.\.venv312\Scripts\python.exe -m pytest -q
-```
+## What kind of data it handles
 
-## Try the demo
+The system figures out the task type on its own:
 
-Upload `data/customer_churn_demo.csv` in the frontend.
+- If your target column has categories (yes/no, red/blue/green, churned/retained), it runs classification and trains Logistic Regression, Random Forest, and XGBoost
+- If your target column has continuous numbers (house price, temperature, revenue), it runs regression and trains Random Forest, Ridge, and XGBoost
+- If there's no obvious target, it profiles your data and recommends clustering or anomaly detection approaches — but it won't deploy a model without a labeled target
+- If you upload a COCO object detection JSON, it recognizes it and explains what tools you'd need rather than pretending it can train on annotation metadata alone
 
-```text
-Target column:  churn
-Metric:         F1 score
-Minimum score:  0.80
-```
+File formats that work: CSV, JSON, JSONL, XML, Excel (.xlsx and .xls), Parquet
 
-The file includes missing values so the cleaning and imputation path is visible. A small demo dataset can produce an excellent score without proving production quality.
+---
+
+## Running the tests
+
+    .\.venv312\Scripts\python.exe -m pytest -v
+
+---
+
+## Try the included demo
+
+Upload data/customer_churn_demo.csv. The system will suggest churn as the target — confirm it. Use F1 score as the metric and 0.80 as the minimum. Three models will train, the best one will be compared against 0.80, and if it passes you'll see an approval button. Approve it and the prediction panel appears. Enter customer values (tenure, monthly charges, contract type) and get a churn prediction with a confidence percentage.
+
+---
 
 ## API endpoints
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Check that the service is running |
-| `POST` | `/api/analyze` | Upload data and run the workflow |
-| `GET` | `/api/runs/{run_id}` | Read a completed run |
-| `POST` | `/api/runs/{run_id}/predict` | Predict using an approved model |
-| `GET` | `/api/monitoring/{run_id}` | Read monitoring signals |
-| `GET` | `/metrics` | Prometheus metrics |
+| Method | Endpoint | What it does |
+|---|---|---|
+| POST | /api/profile | Profile a file — get column types and a suggested target without training anything |
+| POST | /api/analyze | Run the full pipeline |
+| GET | /api/runs/{run_id} | Fetch results for a run |
+| POST | /api/runs/{run_id}/approve | Approve or reject a model before it gets deployed |
+| POST | /api/runs/{run_id}/predict | Send feature values, get a prediction back |
+| POST | /api/runs/{run_id}/feedback | Tell the system what the actual outcome was, for accuracy tracking |
+| GET | /api/monitoring/{run_id} | See drift and performance signals for a deployed model |
+| GET | /health | Check the service is alive |
+| GET | /metrics | Prometheus-format metrics |
 
-## Docker
+---
 
-The Docker image builds both the React frontend and FastAPI backend:
+## Optional monitoring stack
 
-```powershell
-docker compose up --build
-```
+If you want Prometheus, Grafana, MLflow, and PostgreSQL too:
 
-Open `http://localhost:8010`.
+    docker compose --profile infra up --build
 
-Optional Prometheus, Grafana, PostgreSQL, and MLflow services:
+Prometheus → http://localhost:9090
+Grafana → http://localhost:3001
+MLflow → http://localhost:5000
 
-```powershell
-docker compose --profile infra up --build
-```
+---
 
-## Current limits
+## What it can't do yet
 
-- Models and run data are stored locally; there is no durable database yet.
-- Research uses a local catalog instead of live paper or document search.
-- Monitoring exposes signal names and counters; a full drift detector is still needed.
-- Authentication, model registry promotion, security scanning, and cloud storage are not implemented.
+A few honest gaps worth knowing before you take this further:
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design decisions.
+- There's no login system. Anyone who can reach the port can use the API.
+- Runs are kept in memory. If the container restarts, the in-memory run list is gone (though model artifacts and workflow checkpoints survive in the volume).
+- Monitoring tracks signals but doesn't send alerts. You'd need to configure Alertmanager or a similar tool to actually get notified.
+- Models use reasonable default hyperparameters. There's no automatic tuning yet.
+- The research agent uses a local catalog of methods. It doesn't search papers or external sources.
+
+See ARCHITECTURE.md for how the internals are structured.

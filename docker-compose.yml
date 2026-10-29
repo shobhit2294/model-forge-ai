@@ -1,9 +1,19 @@
 services:
   agent:
     build: .
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-sqlite:///artifacts/mlflow.db}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-ModelForge}
+      MONITORING_DB_PATH: /service/artifacts/monitoring.sqlite
+      MONITORING_MIN_PREDICTIONS: ${MONITORING_MIN_PREDICTIONS:-30}
+      MONITORING_PSI_THRESHOLD: ${MONITORING_PSI_THRESHOLD:-0.2}
+      MONITORING_PERFORMANCE_DEGRADATION_THRESHOLD: ${MONITORING_PERFORMANCE_DEGRADATION_THRESHOLD:-0.2}
     ports:
       - "8010:8000"
     restart: unless-stopped
+    volumes:
+      - agent-artifacts:/service/artifacts
+      - agent-mlflow:/mlruns
   prometheus:
     image: prom/prometheus:v2.55.1
     profiles: [infra]
@@ -11,6 +21,7 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/alerts.yml:/etc/prometheus/alerts.yml:ro
       - agent-prometheus:/prometheus
   grafana:
     image: grafana/grafana:11.4.0
@@ -45,6 +56,7 @@ services:
     volumes:
       - agent-mlflow:/mlruns
 volumes:
+  agent-artifacts:
   agent-postgres:
   agent-prometheus:
   agent-grafana:

@@ -1,0 +1,28 @@
+# Python
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Frontend build deps & output (rebuilt inside Docker by Stage 1)
+frontend/node_modules/
+frontend/dist/
+
+# Pre-built static files on disk (Docker uses the Stage 1 build instead)
+app/static/
+
+# Artifacts (generated at runtime, not part of the image)
+artifacts/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+*.log
+.github/
+

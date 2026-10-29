@@ -1,140 +1,175 @@
-# AI Engineering Agent Architecture
+# How It All Works
 
-## Purpose
+This doc walks through how the AI Engineering Agent is actually built — what each piece does, how they talk to each other, and why certain choices were made. Written for someone who wants to understand the system, not just run it.
 
-The application turns an uploaded dataset into an evidence-based model decision. It is local-first: the complete workflow runs without cloud credentials or an external LLM.
+---
 
-## System flow
+## The big picture
 
-```mermaid
-flowchart LR
-  ReactFrontend[React + Vite UI] -->|FormData| FastAPIService[FastAPI API]
-  FastAPIService --> WorkflowOrchestrator[Orchestrator]
-  WorkflowOrchestrator --> LangGraphWorkflow[LangGraph workflow]
-  LangGraphWorkflow --> DataAgent[Data Agent]
-  DataAgent --> ResearchAgent[Research Agent]
-  ResearchAgent --> ModelAgent[Model Agent]
-  ModelAgent --> DecisionAgent{Decision Agent\nquality gate}
-  DecisionAgent -->|approved| JoblibArtifact[Joblib artifact]
-  DecisionAgent -->|needs improvement| NextExperiment[Next experiment]
-  JoblibArtifact --> PredictionEndpoint[Prediction endpoint]
-  FastAPIService --> HealthMetrics[Health and metrics]
-  PredictionEndpoint --> HealthMetrics
-```
+You upload a dataset. The system figures out what kind of problem it is, trains a few models, picks the best one, and then waits for you to approve before saving anything. Once approved, you can send new data and get predictions back.
 
-### Request path
+Here's the full flow:
 
-1. The React form sends the dataset, target column, metric, goal, and minimum score to `POST /api/analyze`.
-2. FastAPI validates the upload and passes the bytes plus request settings to the orchestrator.
-3. The orchestrator profiles the data, creates the research plan, evaluates models, and applies the quality gate.
-4. The API returns the complete run result, including stages, metrics, decision, deployment state, and monitoring signals.
+    React UI  →  FastAPI  →  Orchestrator  →  LangGraph workflow
+                                                      |
+                              Data Agent → Preprocessing → Training → Evaluation → Decision
+                                                      |
+                                          [passes quality gate]
+                                                      |
+                                          Human approval pause
+                                                      |
+                                          Deployment Agent → artifacts/<run_id>.joblib
+                                                      |
+                                          Prediction endpoint → Monitoring (SQLite)
+                                                      ↑
+                                          Delayed-label feedback
 
-### Prediction path
+---
 
-```mermaid
-sequenceDiagram
-  participant User
-  participant UI as React UI
-  participant API as FastAPI
-  participant Artifact as Joblib pipeline
+## Step by step — what happens when you hit Analyze
 
-  User->>UI: Enter feature values
-  UI->>API: POST /api/runs/{run_id}/predict
-  API->>Artifact: Load trained preprocessing + model
-  Artifact-->>API: Prediction and probability
-  API-->>UI: JSON result
-```
+1. You upload a file — the UI sends it to POST /api/profile. The backend reads the columns, guesses types, and suggests a target column if it can find one.
 
-## Agent responsibilities
+2. You confirm — pick a target column (or skip to profile-only mode). Hit Analyze. The file goes to POST /api/analyze.
 
-| Agent | Responsibility | Output |
-| --- | --- | --- |
-| Data Agent | Detect format, schema, column types, missing values, duplicates, and target | Dataset profile and quality report |
-| Research Agent | Select methods from the approved local catalog | Methods and experiment plan |
-| Model Agent | Preprocess data, train candidates, and evaluate them | Metrics and best model |
-| Decision Agent | Compare the selected metric with the requested threshold | `approved` or `needs_improvement` |
-| DevOps Agent | Fit the winning pipeline and save it | `artifacts/<run_id>.joblib` |
-| Monitoring Agent | Register workflow, latency, error, and prediction signals | Prometheus metrics and signal names |
+3. The workflow kicks off — FastAPI hands it to the orchestrator, which runs a LangGraph pipeline. Six agents run in sequence.
 
-## ML decision paths
+4. Agents do their thing — data profiling → preprocessing plan → model training → evaluation → decision. Each step logs what it did.
 
-```mermaid
-flowchart TD
-  DatasetProfile[Profile dataset] --> TargetAvailable{Target available?}
-  TargetAvailable -->|No| UnsupervisedRecommendation[Recommendation only\nNo supervised deployment]
-  TargetAvailable -->|Yes| TargetType{Target type}
-  TargetType -->|Category| ClassificationModels[Classification\nRandom Forest + Logistic Regression]
-  TargetType -->|Continuous number| RegressionModels[Regression\nRandom Forest + Ridge]
-  ClassificationModels --> ClassificationMetrics[F1, accuracy, precision, recall\nconfusion matrix]
-  RegressionModels --> RegressionMetrics[MAE, RMSE, R2]
-  ClassificationMetrics --> QualityGate[Quality gate]
-  RegressionMetrics --> QualityGate
-```
+5. Quality gate check — if the best model clears the threshold, the run pauses and waits for your approval. If not, it tells you why and stops.
 
-All supervised models use a leakage-safe scikit-learn `Pipeline`. Numeric columns use median imputation and scaling. Categorical columns use most-frequent imputation and one-hot encoding. The preprocessing and estimator are saved together for consistent prediction.
+6. You approve — hit the Approve button. The orchestrator resumes from a saved checkpoint (even if you restarted the server), fits the final pipeline, and writes it to artifacts/<run_id>.joblib.
 
-## Repository boundaries
+7. Predict away — send new data to POST /api/runs/{run_id}/predict. The saved pipeline preprocesses it and returns a prediction.
 
-```text
-frontend/src/main.jsx       React UI and API requests
-frontend/vite.config.js     Vite development server and /api proxy
-app/main.py                 FastAPI routes and in-memory run registry
-app/orchestrator.py         End-to-end workflow and deployment decision
-app/pipeline.py             Parsing, profiling, preprocessing, training, metrics
-app/research.py             Approved research and model catalog
-app/workflow_graph.py       LangGraph nodes and conditional routing
-app/metrics.py              Prometheus counters and latency metrics
-artifacts/                  Serialized approved model pipelines
-tests/                      Backend behavior tests
-```
+---
 
-## Technology decisions
+## What each agent actually does
 
-| Area | Choice | Why |
-| --- | --- | --- |
-| Frontend | React + Vite | React renders the upload and result screens. Vite serves the frontend and forwards `/api` requests during local development. |
-| API | FastAPI | Provides one HTTP boundary for upload, workflow, prediction, health, and metrics. |
-| Orchestration | LangGraph | Connects named agents with conditional edges so the decision route is inspectable. |
-| Runtime | Python | Runs the API, parsing, orchestration, quality checks, and model workflow. |
-| Data processing | pandas and Python readers | Supports CSV, JSON, JSONL, Excel, and Parquet input. |
-| Machine learning | scikit-learn | Provides preprocessing, candidate models, holdout evaluation, and reusable pipelines. |
-| Model storage | Joblib files | Stores the fitted preprocessing and estimator together for local inference. |
-| Research | Approved local catalog | Avoids unsupported citations and external API credentials. |
-| Monitoring | Prometheus client | Exposes request, error, prediction, and latency metrics at `/metrics`. |
-| Packaging | Docker and Docker Compose | Builds the React frontend and runs the API consistently. |
+| Agent | What it does | What it produces |
+|---|---|---|
+| Data Profiling Agent | Reads the file, detects columns, finds missing values, flags duplicates, checks for leakage, guesses the task type | A structured profile and a list of quality issues |
+| Preprocessing Agent | Builds a leakage-safe plan — which columns to impute, scale, or encode, using only training data statistics | A preprocessing spec that becomes a scikit-learn Pipeline |
+| Model Training Agent | Trains 2–3 candidate models on the training split (holdout or cross-validation, your choice) | Predictions for the held-out rows from each candidate |
+| Evaluation Agent | Scores every candidate with deterministic Python functions, picks the winner | Metrics, confusion matrix, and the winning model |
+| Decision Agent | Checks the winning score against your threshold | awaiting_approval, needs_improvement, or failed |
+| Deployment Agent | Only runs after you approve — fits the final pipeline on all data, saves it | artifacts/<run_id>.joblib |
 
-### Stack connection
+---
 
-```text
-React UI -> Vite -> FastAPI -> LangGraph -> Python workflow
-                                      |
-                                      v
-                         pandas -> scikit-learn -> Joblib
-                                      |
-                                      v
-                         FastAPI prediction endpoint
-```
+## How the ML decisions are made
 
-## Quality gate and feedback
+When a dataset comes in, the system works through this logic:
 
-- The requested metric and minimum score are checked against the winning experiment.
-- Duplicate records block deployment.
-- Missing labels, too few labeled rows, and unsupported task types block supervised deployment.
-- Approved runs create `artifacts/<run_id>.joblib`.
-- Blocked runs return a next step to change features, preprocessing, or hyperparameters.
-- The LangGraph route records whether the next action is deployment or another experiment.
+- No target column → profiling only, no model deployed
+- Target column is categorical → classification: Logistic Regression + Random Forest + XGBoost → scored on F1, accuracy, precision, recall
+- Target column is numeric → regression: Random Forest + XGBoost + Ridge → scored on MAE, RMSE, R²
+- Either path ends at a quality gate before any model gets deployed
 
-## Runtime endpoints
+The system never uses an LLM to pick models or compute metrics. All model selection and scoring is done by scikit-learn with fixed random seeds so results are reproducible.
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `GET` | `/health` | Service health check |
-| `POST` | `/api/analyze` | Start a workflow run |
-| `GET` | `/api/runs/{run_id}` | Read a run result |
-| `POST` | `/api/runs/{run_id}/predict` | Run inference with an approved model |
-| `GET` | `/api/monitoring/{run_id}` | Read monitoring signals |
-| `GET` | `/metrics` | Prometheus exposition endpoint |
+Every model runs inside a scikit-learn Pipeline with a ColumnTransformer:
+- Numeric columns: median imputation, then standard scaling
+- Categorical columns: most-frequent imputation, then one-hot encoding
 
-## Production gaps
+This prevents data leakage — the imputation and scaling statistics are computed only on training rows.
 
-The MVP still needs authentication, durable run storage, a model registry, cloud object storage, real research connectors, MLflow tracking, a real drift detector, fairness testing, security scanning, and cloud tenancy before production use.
+---
+
+## Where things live in the repo
+
+    frontend/src/main.jsx       — The React UI: upload form, results display, approval button
+    frontend/vite.config.js     — Dev server config; proxies /api to the backend on port 8010
+    app/main.py                 — All the API routes and the in-memory run registry
+    app/orchestrator.py         — Coordinates the full workflow from upload to deployment
+    app/pipeline.py             — Parsing, profiling, preprocessing, training, and metrics
+    app/research.py             — A local catalog of approved methods (no external LLM calls)
+    app/workflow_graph.py       — LangGraph nodes and the routing logic between them
+    app/metrics.py              — Prometheus counters and latency histograms
+    app/monitoring.py           — Drift tracking and delayed-label performance, stored in SQLite
+    artifacts/                  — Where approved model pipelines are saved after approval
+    infra/alerts.yml            — Prometheus alert rules for latency, drift, and failures
+    tests/                      — Backend tests covering the pipeline and workflow behavior
+
+---
+
+## Why these tools were chosen
+
+React + Vite — React handles the upload form and result rendering. Vite makes local development fast and automatically forwards /api requests to the Python backend.
+
+FastAPI — One clean HTTP layer for everything: upload, workflow control, prediction, health check, and Prometheus metrics. FastAPI's async support keeps things snappy under load.
+
+LangGraph + SQLite checkpointer — LangGraph gives the workflow a proper state machine with retry logic and structured logging per node. The SQLite checkpointer means a pending approval survives a server restart — the workflow picks up exactly where it left off.
+
+pandas + format readers — Handles CSV, JSON, JSONL, XML, Excel, and Parquet. XML with nested elements gets flattened to dotted column names automatically.
+
+scikit-learn + XGBoost — Battle-tested, reproducible, and runs on a laptop without a GPU. XGBoost adds a strong gradient boosting candidate without requiring a separate training cluster.
+
+Joblib — Saves the entire fitted Pipeline (preprocessing + model) in one file. Loading it back for predictions is a single line.
+
+Prometheus client + SQLite — The Prometheus client exposes live latency, error rate, and drift signals. SQLite stores persistent aggregate monitoring state between server restarts.
+
+Docker + Docker Compose — A two-stage build: Node builds the React frontend, then Python takes the built assets and runs the API. Compose adds optional Prometheus, Grafana, Postgres-backed MLflow, and a named volume for artifacts.
+
+---
+
+## What happens when something goes wrong
+
+The workflow is designed to stop cleanly rather than silently produce bad results:
+
+- No target column → profiling-only mode, no model deployment
+- Too few labeled rows → blocked with a clear message
+- Duplicate rows detected → blocked before training
+- Score below threshold → needs_improvement, no approval gate shown
+- Any node fails → retried up to the configured limit, then the run is marked failed with the error logged
+
+These cases are all covered by backend tests so the demo shows both the happy path and meaningful failure reasons.
+
+---
+
+## Monitoring and feedback
+
+After a model is deployed, every prediction is tracked:
+
+- Input drift — feature distributions are binned and compared to the training baseline using PSI (Population Stability Index). Reported after at least 30 predictions.
+- Delayed labels — you can send back the actual outcome for any prediction using its ID. The system updates accuracy/F1 (classification) or MAE/RMSE/R² (regression) against the validation baseline.
+- Prometheus — /metrics exposes prediction latency (p95), error rate, drift score, and performance degradation. The infra profile adds Grafana dashboards and alert evaluation via infra/alerts.yml.
+
+Raw inputs are never stored — only aggregate bin counts and hashed categorical values.
+
+---
+
+## Experiment tracking (MLflow)
+
+Every workflow run logs a parent MLflow run. Each candidate model gets a child run with its parameters, runtime versions, validation metrics, and a SHA-256 fingerprint of the dataset (not the raw data). Approved models are registered in the MLflow model registry after the approval step, tagged with the run ID and dataset fingerprint.
+
+Local development uses artifacts/mlflow.db. The optional infra Compose profile adds a proper MLflow UI backed by PostgreSQL.
+
+---
+
+## API endpoints
+
+| Method | Path | What it does |
+|---|---|---|
+| GET | /health | Quick health check |
+| POST | /api/profile | Upload a file and get its schema + suggested target |
+| POST | /api/analyze | Start a full workflow run |
+| GET | /api/runs/{run_id} | Get the result and status of a run |
+| POST | /api/runs/{run_id}/approve | Approve or reject a pending run |
+| POST | /api/runs/{run_id}/predict | Run inference with an approved model |
+| POST | /api/runs/{run_id}/feedback | Send back the actual label for a past prediction |
+| GET | /api/monitoring/{run_id} | Check drift and performance status |
+| GET | /metrics | Prometheus metrics endpoint |
+
+---
+
+## What's not production-ready yet
+
+This is an MVP. It works well for demos and local experimentation but a few things would need to be added before running it for real users:
+
+- No authentication — anyone who can reach the API can run workflows and access results
+- In-memory run registry — restarts lose all run state (workflow checkpoints survive but the run list doesn't)
+- Local artifact storage — model files are on disk, not in durable cloud storage
+- No alert delivery — Prometheus rules are defined but there's no Alertmanager configured to actually send alerts
+- No fairness or bias testing — the pipeline doesn't check for demographic parity or disparate impact
+- Single instance only — the run registry and SQLite stores don't support multiple API replicas

@@ -14,16 +14,14 @@ from sklearn.pipeline import Pipeline
 from app.pipeline import (
     DatasetProfile,
     _classification_candidates,
+    _is_missing,
+    _leakage_risks,
     _parse_rows,
     _preprocessor,
     _regression_candidates,
-    evaluate_models,
-    pipeline_result,
-    profile_dataset,
-    recommend_models,
 )
 from app.research import research_methods
-from app.workflow_graph import build_workflow_graph
+from app.workflow_graph import build_workflow_graph, get_checkpointed_state, resume_workflow
 
 
 @dataclass
@@ -33,6 +31,9 @@ class RunRequest:
     minimum_score: float | None
     target: str | None
     max_experiments: int = 3
+    validation_strategy: str = "holdout"
+    max_retries: int = 2
+    target_confirmed: bool = False
 
 
 def _quality_report(profile: DatasetProfile, content: bytes) -> dict[str, Any]:
@@ -40,20 +41,28 @@ def _quality_report(profile: DatasetProfile, content: bytes) -> dict[str, Any]:
     if profile.task == "computer_vision":
         return {"duplicates": 0, "duplicate_rate": 0.0, "outliers": 0, "class_balance": {}, "checks": ["COCO schema detected"]}
     duplicate_count = len(rows) - len({json.dumps(row, sort_keys=True) for row in rows})
-    target_values = [row.get(profile.target) for row in rows] if profile.target else []
+    missing_values = sum(item.missing for item in profile.column_profiles)
+    leakage_risks = _leakage_risks(profile, rows)
+    target_values = [row.get(profile.target) for row in rows] if profile.task == "classification" and profile.target else []
     class_balance: dict[str, int] = {}
     for value in target_values:
-        if value not in (None, ""):
+        if not _is_missing(value):
             key = str(value)
             class_balance[key] = class_balance.get(key, 0) + 1
     checks = ["schema validated", "missing values profiled", "duplicate records checked"]
+    if missing_values:
+        checks.append(f"{missing_values} missing values detected; model pipelines will impute within each training split")
     if duplicate_count:
         checks.append("duplicate records require removal before production")
+    if leakage_risks:
+        checks.append("potential target leakage detected; review flagged features")
     if class_balance and min(class_balance.values()) / max(class_balance.values()) < 0.5:
         checks.append("class imbalance detected; compare weighted metrics and class-aware training")
     return {
         "duplicates": duplicate_count,
         "duplicate_rate": round(duplicate_count / len(rows), 4) if rows else 0.0,
+        "missing_values": missing_values,
+        "leakage_risks": leakage_risks,
         "outliers": 0,
         "class_balance": class_balance,
         "checks": checks,
@@ -74,37 +83,17 @@ def _research_plan(profile: DatasetProfile, recommendation: dict[str, Any]) -> d
     }
 
 
-def _metric_value(result: dict[str, Any], metric: str, task: str) -> float | None:
-    aliases = {
-        "f1": "f1",
-        "accuracy": "accuracy",
-        "precision": "precision",
-        "recall": "recall",
-        "r2": "r2",
-        "mae": "mae",
-        "rmse": "rmse",
-    }
-    requested = metric.lower()
-    if task == "regression" and requested in {"f1", "accuracy", "precision", "recall"}:
-        requested = "r2"
-    key = aliases.get(requested)
-    if key is None:
-        key = "f1" if task == "classification" else "r2"
-    value = result.get(key)
-    return float(value) if value is not None else None
-
-
 def _fit_for_deployment(profile: DatasetProfile, content: bytes, model_name: str) -> tuple[Pipeline, list[str]] | None:
     if profile.task not in {"classification", "regression"} or not profile.target:
         return None
     _, rows = _parse_rows(profile.filename, content)
-    rows = [row for row in rows if row.get(profile.target) not in (None, "")]
+    rows = [row for row in rows if not _is_missing(row.get(profile.target))]
     feature_names = [item.name for item in profile.column_profiles if item.name != profile.target]
     numeric_names = {item.name for item in profile.column_profiles if item.data_type == "numeric"}
     features = []
     labels = []
     for row in rows:
-        features.append([None if row.get(name) in (None, "") else float(row[name]) if name in numeric_names else row[name] for name in feature_names])
+        features.append([None if _is_missing(row.get(name)) else float(row[name]) if name in numeric_names else row[name] for name in feature_names])
         labels.append(float(row[profile.target]) if profile.task == "regression" else str(row[profile.target]))
     candidates = _classification_candidates() if profile.task == "classification" else _regression_candidates()
     estimator = candidates.get(model_name)
@@ -117,41 +106,127 @@ def _fit_for_deployment(profile: DatasetProfile, content: bytes, model_name: str
 
 def run_workflow(filename: str, content: bytes, request: RunRequest) -> tuple[str, dict[str, Any], Pipeline | None, list[str] | None]:
     run_id = uuid.uuid4().hex[:12]
-    profile = profile_dataset(filename, content, request.target)
-    recommendation = recommend_models(profile)
-    quality = _quality_report(profile, content)
-    research = _research_plan(profile, recommendation)
-    base = pipeline_result(profile, content)
-    evaluation = base["evaluation"]
-    experiments = []
-    if evaluation and evaluation.get("status") == "complete":
-        experiments = [{**result, "status": "completed"} for result in evaluation["models"]]
-    elif evaluation:
-        experiments = [{"status": "blocked", "reason": evaluation["reason"]}]
-    best_score = next((_metric_value(item, request.metric, profile.task) for item in experiments if item.get("model") == evaluation.get("best_model")), None) if evaluation and evaluation.get("status") == "complete" else None
-    lower_is_better = profile.task == "regression" and request.metric.lower() in {"mae", "rmse"}
-    threshold_met = request.minimum_score is None or (best_score is not None and ((best_score <= request.minimum_score) if lower_is_better else (best_score >= request.minimum_score)))
-    approved = bool(evaluation and evaluation.get("status") == "complete" and threshold_met and quality["duplicates"] == 0)
-    best_model = evaluation.get("best_model") if evaluation else None
-    deployment = {"status": "approved" if approved else "blocked", "model": best_model, "artifact": f"artifacts/{run_id}.joblib" if approved else None, "reason": "Quality gate passed." if approved else "Performance threshold, labels, or data-quality requirements are not satisfied."}
-    if approved and best_model:
-        fitted_model = _fit_for_deployment(profile, content, best_model)
-        if fitted_model:
-            artifact_path = Path("artifacts") / f"{run_id}.joblib"
-            artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump({"model": fitted_model[0], "feature_names": fitted_model[1], "profile": asdict(profile)}, artifact_path)
-    else:
-        fitted_model = None
-    decision = {"status": "approved" if approved else "needs_improvement", "best_model": best_model, "metric": request.metric, "best_score": best_score, "threshold": request.minimum_score, "next_step": "Deploy approved model." if approved else "Run another experiment after changing features, preprocessing, or hyperparameters."}
-    stages = [
-        {"agent": "Data Agent", "status": "complete", "output": quality},
-        {"agent": "Research Agent", "status": "complete", "output": research},
-        {"agent": "Model Agent", "status": "complete" if experiments and experiments[0].get("status") == "completed" else "blocked", "output": experiments},
-        {"agent": "Decision Agent", "status": decision["status"], "output": decision},
-        {"agent": "DevOps Agent", "status": deployment["status"], "output": deployment},
-        {"agent": "Monitoring Agent", "status": "armed" if approved else "waiting", "output": {"signals": ["latency", "errors", "prediction distribution", "data drift", "model performance"]}},
+    if not 0 <= request.max_retries <= 5:
+        raise ValueError("max_retries must be between 0 and 5.")
+    graph = build_workflow_graph()
+    state = graph.invoke(
+        {
+            "run_id": run_id,
+            "filename": filename,
+            "content": content,
+            "request": asdict(request),
+            "execution_log": [],
+            "node_outputs": {},
+            "errors": [],
+        },
+        {"configurable": {"thread_id": run_id}},
+    )
+    result = _workflow_result(run_id, state)
+    return run_id, result, None, state.get("prepared", {}).get("feature_names")
+
+
+def _workflow_result(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    evaluation = state.get("evaluation", {"status": "unavailable", "reason": "Workflow failed before evaluation."})
+    experiments = [
+        {**model, "status": "completed"}
+        for model in evaluation.get("models", [])
     ]
-    result = {**base, "run_id": run_id, "request": asdict(request), "quality": quality, "research": research, "experiments": experiments, "decision": decision, "deployment": deployment, "monitoring": stages[-1]["output"], "stages": stages}
-    graph_state = build_workflow_graph().invoke({"request": asdict(request), "decision": decision, "loop_count": 0})
-    result["orchestration"] = {"engine": "LangGraph", "next_action": graph_state.get("next_action"), "loop_count": graph_state.get("loop_count", 0)}
-    return run_id, result, fitted_model[0] if fitted_model else None, fitted_model[1] if fitted_model else None
+    if evaluation.get("status") != "complete" and not experiments:
+        experiments = [{"status": "blocked", "reason": evaluation.get("reason", "Evaluation unavailable.")}]
+    deployment = state.get("deployment", {"status": "blocked", "reason": "Workflow failed before deployment preparation."})
+    decision = state.get("decision", {
+        "status": "failed",
+        "best_model": None,
+        "metric": None,
+        "best_score": None,
+        "threshold": None,
+        "next_step": "Review the workflow error log.",
+    })
+    outputs = state.get("node_outputs", {})
+    stages = [
+        {"agent": "Data Profiling Agent", "status": outputs.get("data_profiling", {}).get("status", "blocked"), "output": state.get("quality", {})},
+        {"agent": "Preprocessing Agent", "status": outputs.get("preprocessing", {}).get("status", "blocked"), "output": state.get("prepared", {})},
+        {"agent": "Model Training Agent", "status": outputs.get("model_training", {}).get("status", "blocked"), "output": state.get("training", {})},
+        {"agent": "Evaluation Agent", "status": outputs.get("evaluation", {}).get("status", "blocked"), "output": evaluation},
+        {"agent": "Decision Agent", "status": outputs.get("decision", {}).get("status", "blocked"), "output": decision},
+        {"agent": "Deployment Preparation Agent", "status": outputs.get("deployment_preparation", {}).get("status", "blocked"), "output": state.get("deployment_preparation", {})},
+        {"agent": "Approval Agent", "status": outputs.get("deployment_approval", {}).get("status", "pending"), "output": state.get("deployment_approval", {"status": "pending"})},
+        {"agent": "Deployment Agent", "status": outputs.get("deployment", {}).get("status", "pending"), "output": deployment},
+    ]
+    if state.get("profile"):
+        monitoring = {
+            "signals": ["latency", "errors", "prediction distribution", "data drift", "model performance"],
+            "status": "armed" if deployment.get("status") == "approved" else "waiting",
+        }
+        return {
+            "profile": state["profile"],
+            "recommendation": state.get("recommendation", {}),
+            "evaluation": evaluation,
+            "research": state.get("research", {}),
+            "run_id": run_id,
+            "request": state.get("request", {}),
+            "quality": state.get("quality", {}),
+            "tracking": state.get("tracking", {"status": "unavailable"}),
+            "experiments": experiments,
+            "decision": decision,
+            "deployment": deployment,
+            "deployment_preparation": state.get("deployment_preparation", {}),
+            "deployment_approval": state.get("deployment_approval", {"status": "pending", "approved": False}),
+            "monitoring": monitoring,
+            "stages": stages,
+            "execution_log": state.get("execution_log", []),
+            "errors": state.get("errors", []),
+            "orchestration": {
+                "engine": "LangGraph",
+                "checkpointed": True,
+                "next_action": "awaiting_approval" if deployment.get("status") == "awaiting_approval" else state.get("workflow_status", "complete"),
+                "retry_limit": state.get("request", {}).get("max_retries", 2),
+            },
+        }
+    return {
+        "profile": {"filename": "", "format": "unknown", "rows": 0, "columns": 0, "target": None, "task": "unknown", "warnings": [], "column_profiles": []},
+        "recommendation": {},
+        "evaluation": evaluation,
+        "research": {},
+        "quality": {},
+        "tracking": state.get("tracking", {"status": "unavailable"}),
+        "run_id": run_id,
+        "request": state.get("request", {}),
+        "decision": decision,
+        "deployment": deployment,
+        "deployment_preparation": state.get("deployment_preparation", {}),
+        "deployment_approval": state.get("deployment_approval", {"status": "pending", "approved": False}),
+        "stages": stages,
+        "execution_log": state.get("execution_log", []),
+        "errors": state.get("errors", []),
+        "orchestration": {
+            "engine": "LangGraph",
+            "checkpointed": True,
+            "next_action": "failed",
+            "retry_limit": state.get("request", {}).get("max_retries", 2),
+        },
+    }
+
+
+def approve_workflow(run_id: str, approved: bool, reviewer: str | None = None) -> tuple[dict[str, Any], Pipeline | None, list[str] | None]:
+    state = resume_workflow(build_workflow_graph(), run_id, approved, reviewer)
+    result = _workflow_result(run_id, state)
+    if result["deployment"]["status"] != "approved":
+        return result, None, None
+    artifact = joblib.load(result["deployment"]["artifact"])
+    return result, artifact["model"], artifact["feature_names"]
+
+
+def restore_workflow_run(run_id: str) -> dict[str, Any] | None:
+    state = get_checkpointed_state(run_id)
+    if state is None:
+        return None
+    result = _workflow_result(run_id, state)
+    model = None
+    feature_names = state.get("feature_names") or state.get("prepared", {}).get("feature_names")
+    artifact_path = result.get("deployment", {}).get("artifact")
+    if artifact_path and Path(artifact_path).is_file():
+        artifact = joblib.load(artifact_path)
+        model = artifact["model"]
+        feature_names = artifact["feature_names"]
+    return {"result": result, "model": model, "feature_names": feature_names, "profile": result.get("profile", {})}

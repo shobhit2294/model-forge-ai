@@ -4,6 +4,16 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Runtime artifacts — generated files, not source code
+artifacts/*.joblib
+artifacts/*.sqlite
+artifacts/*.sqlite-shm
+artifacts/*.sqlite-wal
+artifacts/mlflow.db
+
+# MLflow experiment tracking data
+mlruns/
+
 frontend/node_modules/
 frontend/dist/
 

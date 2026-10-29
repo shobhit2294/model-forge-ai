@@ -13,12 +13,12 @@ METHOD_CATALOG: dict[str, list[dict[str, str]]] = {
     "classification": [
         {"method": "Logistic Regression", "use": "interpretable baseline"},
         {"method": "Random Forest", "use": "nonlinear tabular baseline"},
-        {"method": "Gradient Boosting", "use": "strong tabular candidate"},
+        {"method": "XGBoost", "use": "gradient-boosted tabular candidate"},
     ],
     "regression": [
         {"method": "Ridge Regression", "use": "regularized baseline"},
         {"method": "Random Forest", "use": "nonlinear tabular baseline"},
-        {"method": "Gradient Boosting", "use": "strong tabular candidate"},
+        {"method": "XGBoost", "use": "gradient-boosted tabular candidate"},
     ],
     "computer_vision": [
         {"method": "YOLO", "use": "fast object-detection baseline"},
